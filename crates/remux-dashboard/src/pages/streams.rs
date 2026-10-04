@@ -9,9 +9,10 @@ use remux_sdks::remux::{
     common_audio_languages, format_bitrate_rule, format_size_rule, language_label,
     AddonDto, CreateStreamGroup, CreateStreamGroupRequest, DeleteStreamGroup,
     FilterMatchMode, GetStreamGroupPreview, GetSystemConfiguration, ListAddons,
-    ListStreamGroups, NumericOp, ServerConfiguration, SetOp, StreamCodec, StreamFilter,
-    StreamGroupDto, StreamGroupPreviewDto, StreamQuality, StreamResolution, StreamRule,
-    UpdateStreamGroup, UpdateStreamGroupRequest, UpdateSystemConfiguration,
+    ListStreamGroups, NumericOp, ServerConfiguration, SetOp, StreamAudioFormat,
+    StreamCodec, StreamFilter, StreamGroupDto, StreamGroupPreviewDto, StreamQuality,
+    StreamResolution, StreamRule, StreamVideoRange, UpdateStreamGroup,
+    UpdateStreamGroupRequest, UpdateSystemConfiguration,
 };
 use uuid::Uuid;
 
@@ -32,6 +33,8 @@ pub(crate) fn StreamRuleRow(
         StreamRule::SubtitleLanguage { .. } => "subtitle_language",
         StreamRule::Bitrate { .. } => "bitrate",
         StreamRule::Cached { .. } => "cached",
+        StreamRule::VideoRange { .. } => "video_range",
+        StreamRule::AudioFormat { .. } => "audio_format",
     };
     let is_size = field_val == "size";
     let is_numeric = is_size || field_val == "bitrate";
@@ -42,7 +45,9 @@ pub(crate) fn StreamRuleRow(
         | StreamRule::Codec { op, .. }
         | StreamRule::AudioLanguage { op, .. }
         | StreamRule::SubtitleLanguage { op, .. }
-        | StreamRule::Addon { op, .. } => matches!(op, SetOp::NotIn),
+        | StreamRule::Addon { op, .. }
+        | StreamRule::VideoRange { op, .. }
+        | StreamRule::AudioFormat { op, .. } => matches!(op, SetOp::NotIn),
         StreamRule::Size { .. }
         | StreamRule::Bitrate { .. }
         | StreamRule::Cached { .. } => false,
@@ -74,6 +79,8 @@ pub(crate) fn StreamRuleRow(
                             }
                             "bitrate" => StreamRule::Bitrate { op: NumericOp::Gt, value: 0 },
                             "cached" => StreamRule::Cached { value: true },
+                            "video_range" => StreamRule::VideoRange { op: SetOp::In, values: vec![] },
+                            "audio_format" => StreamRule::AudioFormat { op: SetOp::In, values: vec![] },
                             "size"   => StreamRule::Size { op: NumericOp::Gt, value: 0 },
                             _        => StreamRule::Resolution { op: SetOp::In, values: vec![] },
                         };
@@ -88,6 +95,8 @@ pub(crate) fn StreamRuleRow(
                 option { value: "subtitle_language", selected: field_val == "subtitle_language", "Subtitle Language" }
                 option { value: "cached",     selected: is_cached,                "Cached" }
                 option { value: "addon", selected: field_val == "addon", "Addon" }
+                option { value: "video_range", selected: field_val == "video_range", "Dynamic Range" }
+                option { value: "audio_format", selected: field_val == "audio_format", "Audio Format" }
             }
             // Operator selector
             select {
@@ -122,6 +131,8 @@ pub(crate) fn StreamRuleRow(
                                 StreamRule::AudioLanguage { values, .. } => StreamRule::AudioLanguage { op: new_op, values },
                                 StreamRule::SubtitleLanguage { values, .. } => StreamRule::SubtitleLanguage { op: new_op, values },
                                 StreamRule::Addon { values, .. } => StreamRule::Addon { op: new_op, values },
+                                StreamRule::VideoRange { values, .. } => StreamRule::VideoRange { op: new_op, values },
+                                StreamRule::AudioFormat { values, .. } => StreamRule::AudioFormat { op: new_op, values },
                                 other @ (StreamRule::Size { .. }
                                 | StreamRule::Bitrate { .. }
                                 | StreamRule::Cached { .. }) => other,
@@ -303,6 +314,54 @@ pub(crate) fn StreamRuleRow(
                                             },
                                         }
                                         "{name}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if field_val == "video_range" {
+                    div { style: "display:flex;flex-direction:column;gap:6px;white-space:nowrap",
+                        for range in StreamVideoRange::all() {
+                            {
+                                let range = range.clone();
+                                let range_label = range.label().to_string();
+                                let checked = match &rule { StreamRule::VideoRange { values, .. } => values.contains(&range), _ => false };
+                                rsx! {
+                                    label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
+                                        Switch {
+                                            checked,
+                                            on_change: move |v| {
+                                                if let Some(StreamRule::VideoRange { values, .. }) = rules.write().get_mut(idx) {
+                                                    if v { if !values.contains(&range) { values.push(range.clone()); } }
+                                                    else { values.retain(|r| r != &range); }
+                                                }
+                                            },
+                                        }
+                                        "{range_label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if field_val == "audio_format" {
+                    div { style: "display:flex;flex-direction:column;gap:6px;white-space:nowrap",
+                        for format in StreamAudioFormat::all() {
+                            {
+                                let format = format.clone();
+                                let format_label = format.label().to_string();
+                                let checked = match &rule { StreamRule::AudioFormat { values, .. } => values.contains(&format), _ => false };
+                                rsx! {
+                                    label { style: "display:flex;align-items:center;gap:3px;font-size:.82rem;cursor:pointer",
+                                        Switch {
+                                            checked,
+                                            on_change: move |v| {
+                                                if let Some(StreamRule::AudioFormat { values, .. }) = rules.write().get_mut(idx) {
+                                                    if v { if !values.contains(&format) { values.push(format.clone()); } }
+                                                    else { values.retain(|f| f != &format); }
+                                                }
+                                            },
+                                        }
+                                        "{format_label}"
                                     }
                                 }
                             }
@@ -641,6 +700,14 @@ pub fn StreamGroupsCard(app_state: AppState) -> Element {
                                                                     .collect::<Vec<_>>()
                                                                     .join("/");
                                                                 (lbl, matches!(op, SetOp::NotIn), "background:rgba(59,130,246,.12);color:rgb(37,99,235);padding:1px 6px;border-radius:4px")
+                                                            }
+                                                            StreamRule::VideoRange { op, values } => {
+                                                                let lbl = values.iter().map(|v| v.label()).collect::<Vec<_>>().join("/");
+                                                                (lbl, matches!(op, SetOp::NotIn), "background:rgba(168,85,247,.12);color:rgb(147,51,234);padding:1px 6px;border-radius:4px")
+                                                            }
+                                                            StreamRule::AudioFormat { op, values } => {
+                                                                let lbl = values.iter().map(|v| v.label()).collect::<Vec<_>>().join("/");
+                                                                (lbl, matches!(op, SetOp::NotIn), "background:rgba(236,72,153,.12);color:rgb(219,39,119);padding:1px 6px;border-radius:4px")
                                                             }
                                                         };
                                                         let prefix = if is_excl { "NOT " } else { "" };

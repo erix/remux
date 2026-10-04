@@ -549,6 +549,16 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
                     StreamRule::Cached { value } => {
                         if *value { "Cached" } else { "Uncached" }.to_string()
                     }
+                    StreamRule::VideoRange { values, .. } => values
+                        .iter()
+                        .map(|v| v.label())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    StreamRule::AudioFormat { values, .. } => values
+                        .iter()
+                        .map(|v| v.label())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                 })
                 .filter(|s| !s.is_empty())
                 .collect();
