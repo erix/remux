@@ -1,0 +1,191 @@
+# Fork-only: publishes the `deploy` branch as an amd64 image to this repo's
+# GHCR package. Upstream's build/nightly/release workflows stay untouched so
+# rebasing `deploy` onto upstream doesn't conflict with them.
+name: Deploy image
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-image
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Version from the latest upstream release tag
+        id: v
+        run: |
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' 2>/dev/null || echo v0.0.0)
+          echo "version=${base#v}-erix.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+  jellyfin-web:
+    name: Build jellyfin-web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cache jellyfin-web dist
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: jellyfin-web/
+          key: jellyfin-web-v12.1
+
+      - name: Checkout jellyfin-web
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: jellyfin/jellyfin-web
+          ref: v12.1
+
+      - name: Setup Node
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          npm ci
+          npm run build:production
+          mv dist jellyfin-web
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-web-dist
+          path: jellyfin-web/
+          retention-days: 1
+
+  dashboard:
+    name: Build dashboard
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dashboard
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Set workspace version
+        run: |
+          cargo binstall cargo-edit@0.11.11 --no-confirm --locked
+          cargo set-version "${{ needs.meta.outputs.version }}"
+
+      - name: Build dashboard
+        working-directory: crates/remux-dashboard
+        run: |
+          cargo binstall dioxus-cli@0.7.9 --no-confirm --force --locked
+          ~/.cargo/bin/dx build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: target/dx/remux-dashboard/release/web/public/
+          retention-days: 1
+
+  server:
+    name: Build server
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-amd64
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Set workspace version
+        run: |
+          cargo binstall cargo-edit@0.11.11 --no-confirm --locked
+          cargo set-version "${{ needs.meta.outputs.version }}"
+
+      - name: Build remux-server
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --release -p remux-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-amd64
+          path: target/release/remux-server
+          retention-days: 1
+
+  image:
+    name: Build and push image
+    needs: [meta, jellyfin-web, dashboard, server]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jellyfin-web-dist
+          path: jellyfin-web/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-linux-amd64
+          path: ./
+
+      - run: chmod +x ./remux-server
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ needs.meta.outputs.image }}:latest
+            ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}
+            ${{ needs.meta.outputs.image }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+          cache-from: type=gha,scope=deploy-amd64
+          cache-to: type=gha,mode=max,scope=deploy-amd64
