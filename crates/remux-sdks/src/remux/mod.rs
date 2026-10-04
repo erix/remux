@@ -6997,6 +6997,95 @@ impl StreamCodec {
     }
 }
 
+/// Dynamic range a stream group can require. Like audio formats, a value
+/// matches its family: `Hdr` is any HDR layer (HDR10, HDR10+ or HLG) and
+/// `Hdr10` includes HDR10+. A Dolby Vision stream only counts as HDR when it
+/// carries one of those as a base layer, so profile 5 is `DolbyVision` alone.
+/// `Sdr` is a stream with neither an HDR layer nor Dolby Vision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamVideoRange {
+    Sdr,
+    Hdr,
+    Hdr10,
+    Hdr10Plus,
+    Hlg,
+    DolbyVision,
+}
+
+impl StreamVideoRange {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sdr => "SDR",
+            Self::Hdr => "HDR (any)",
+            Self::Hdr10 => "HDR10",
+            Self::Hdr10Plus => "HDR10+",
+            Self::Hlg => "HLG",
+            Self::DolbyVision => "Dolby Vision",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Sdr,
+            Self::Hdr,
+            Self::Hdr10,
+            Self::Hdr10Plus,
+            Self::Hlg,
+            Self::DolbyVision,
+        ]
+    }
+}
+
+/// Audio a stream group can require. Codec values match any track in that
+/// codec family: `TrueHd` includes TrueHD Atmos, `Dts` includes DTS-HD MA.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamAudioFormat {
+    Atmos,
+    DtsX,
+    TrueHd,
+    DtsHdMa,
+    Dts,
+    DolbyDigitalPlus,
+    DolbyDigital,
+    Aac,
+    Flac,
+    Pcm,
+}
+
+impl StreamAudioFormat {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Atmos => "Atmos",
+            Self::DtsX => "DTS:X",
+            Self::TrueHd => "TrueHD",
+            Self::DtsHdMa => "DTS-HD MA",
+            Self::Dts => "DTS",
+            Self::DolbyDigitalPlus => "DD+",
+            Self::DolbyDigital => "DD",
+            Self::Aac => "AAC",
+            Self::Flac => "FLAC",
+            Self::Pcm => "PCM",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Atmos,
+            Self::DtsX,
+            Self::TrueHd,
+            Self::DtsHdMa,
+            Self::Dts,
+            Self::DolbyDigitalPlus,
+            Self::DolbyDigital,
+            Self::Aac,
+            Self::Flac,
+            Self::Pcm,
+        ]
+    }
+}
+
 /// Common audio languages for the stream-group UI, alphabetical by display name.
 /// Key = ISO 639-2/B code (`MediaStream.language`), value = display name.
 pub fn common_audio_languages() -> &'static [(&'static str, &'static str)] {
@@ -7095,6 +7184,19 @@ pub enum StreamRule {
     Addon {
         op: SetOp,
         values: Vec<Uuid>,
+    },
+    /// Dynamic range: SDR, the HDR formats and Dolby Vision. Judged from probe
+    /// data, else from filename tags. A filename without a tag proves nothing,
+    /// so such a stream passes the rule.
+    VideoRange {
+        op: SetOp,
+        values: Vec<StreamVideoRange>,
+    },
+    /// Audio formats such as Atmos or DTS-HD MA, judged the same way as
+    /// `VideoRange`: probe data first, else filename tags.
+    AudioFormat {
+        op: SetOp,
+        values: Vec<StreamAudioFormat>,
     },
 }
 
@@ -7615,6 +7717,32 @@ mod tests {
         assert_eq!(json, r#"{"field":"size","op":"gt","value":20000000000}"#);
         let back: StreamRule = serde_json::from_str(&json).unwrap();
         assert_eq!(rule, back);
+    }
+
+    #[test]
+    fn stream_rule_video_range_and_audio_format_round_trip() {
+        let rules = [
+            (
+                StreamRule::VideoRange {
+                    op: SetOp::In,
+                    values: vec![StreamVideoRange::Sdr, StreamVideoRange::Hdr10Plus],
+                },
+                r#"{"field":"video_range","op":"in","values":["sdr","hdr10_plus"]}"#,
+            ),
+            (
+                StreamRule::AudioFormat {
+                    op: SetOp::NotIn,
+                    values: vec![StreamAudioFormat::Atmos, StreamAudioFormat::DtsHdMa],
+                },
+                r#"{"field":"audio_format","op":"not_in","values":["atmos","dts_hd_ma"]}"#,
+            ),
+        ];
+        for (rule, expected) in rules {
+            let json = serde_json::to_string(&rule).unwrap();
+            assert_eq!(json, expected);
+            let back: StreamRule = serde_json::from_str(&json).unwrap();
+            assert_eq!(rule, back);
+        }
     }
 
     #[test]

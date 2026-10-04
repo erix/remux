@@ -1,9 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use remux_sdks::remux::{
-    FilterMatchMode, NumericOp, SetOp, StreamCodec, StreamFilter, StreamQuality,
-    StreamResolution, StreamRule, format_size_rule, language_label,
-    normalize_lang_code,
+    FilterMatchMode, NumericOp, SetOp, StreamAudioFormat, StreamCodec, StreamFilter,
+    StreamQuality, StreamResolution, StreamRule, StreamVideoRange, format_size_rule,
+    language_label, normalize_lang_code,
 };
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     api::MediaStreamType,
     db::{Media, Settings, StreamGroupData},
+    device_profile::AudioCodec,
     stream::StreamInfo,
 };
 
@@ -438,6 +439,14 @@ impl StreamGroup {
                         bool_to_outcome(matches!(op, SetOp::In | SetOp::Is) == hit)
                     }
                 },
+                StreamRule::VideoRange { op, values } => {
+                    let features = StreamFeatures::detect(info, probe_data);
+                    feature_outcome(op, values, |v| features.video_range(v))
+                }
+                StreamRule::AudioFormat { op, values } => {
+                    let features = StreamFeatures::detect(info, probe_data);
+                    feature_outcome(op, values, |v| features.audio_format(v))
+                }
             }
         };
 
@@ -685,6 +694,351 @@ pub(crate) fn min_screen_size<'a>(parsed: &'a hunch::HunchResult) -> Option<&'a 
         })
 }
 
+/// What is known about one feature of a stream. Filename tags can only prove
+/// presence (most releases don't tag what they lack); probe data and an
+/// explicit `SDR` tag can also prove absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+impl Evidence {
+    fn from_tag(tagged: bool) -> Self {
+        if tagged { Self::Present } else { Self::Unknown }
+    }
+
+    fn or_absent(self) -> Self {
+        if self == Self::Unknown {
+            Self::Absent
+        } else {
+            self
+        }
+    }
+}
+
+/// A set rule over features: `In` hits when any listed feature is present,
+/// `NotIn` when none is. Without proof either way the stream passes through,
+/// like unprobed streams do for `AudioLanguage`.
+fn feature_outcome<T>(
+    op: &SetOp,
+    values: &[T],
+    evidence: impl Fn(&T) -> Evidence,
+) -> MatchOutcome {
+    let wanted = matches!(op, SetOp::In | SetOp::Is);
+    let evidence: Vec<Evidence> = values
+        .iter()
+        .map(evidence)
+        .collect();
+    if evidence.contains(&Evidence::Present) {
+        bool_to_outcome(wanted)
+    } else if evidence.contains(&Evidence::Unknown) {
+        MatchOutcome::PassThrough
+    } else {
+        bool_to_outcome(!wanted)
+    }
+}
+
+/// What a stream's probe data and release tags say about its features.
+struct StreamFeatures<'a> {
+    tags: ReleaseTags,
+    probe: Option<&'a crate::api::MediaSourceInfo>,
+}
+
+impl<'a> StreamFeatures<'a> {
+    fn detect(
+        info: &StreamInfo,
+        probe: Option<&'a crate::api::MediaSourceInfo>,
+    ) -> Self {
+        Self {
+            tags: ReleaseTags::scan(info),
+            probe,
+        }
+    }
+
+    fn video_range(&self, range: &StreamVideoRange) -> Evidence {
+        if *range == StreamVideoRange::Sdr {
+            return self.sdr();
+        }
+        match self
+            .probe
+            .map(|pd| probed_video_range(pd, range))
+        {
+            Some(settled @ (Evidence::Present | Evidence::Absent)) => settled,
+            _ => {
+                let tagged = Evidence::from_tag(
+                    self.tags
+                        .video
+                        .contains(range),
+                );
+                if self
+                    .tags
+                    .sdr
+                {
+                    tagged.or_absent()
+                } else {
+                    tagged
+                }
+            }
+        }
+    }
+
+    /// ffprobe reports a profile 5 Dolby Vision file as SDR, so an SDR probe
+    /// only counts when the release isn't tagged Dolby Vision.
+    fn sdr(&self) -> Evidence {
+        let tags = &self.tags;
+        let tagged_dv = tags
+            .video
+            .contains(&StreamVideoRange::DolbyVision);
+        match self
+            .probe
+            .map(|pd| probed_video_range(pd, &StreamVideoRange::Sdr))
+        {
+            Some(Evidence::Present) if !tagged_dv => Evidence::Present,
+            Some(Evidence::Present | Evidence::Absent) => Evidence::Absent,
+            _ if !tags
+                .video
+                .is_empty() =>
+            {
+                Evidence::Absent
+            }
+            _ => Evidence::from_tag(tags.sdr),
+        }
+    }
+
+    fn audio_format(&self, format: &StreamAudioFormat) -> Evidence {
+        match self
+            .probe
+            .map(|pd| probed_audio_format(pd, format))
+        {
+            Some(settled @ (Evidence::Present | Evidence::Absent)) => settled,
+            _ => Evidence::from_tag(
+                self.tags
+                    .audio
+                    .contains(format),
+            ),
+        }
+    }
+}
+
+/// The probe classifies only the colour transfer: PQ reads as HDR10 and HLG
+/// as HLG, and anything else as SDR. It can't see Dolby Vision or HDR10+, so a
+/// profile 8 Dolby Vision file probes as HDR10 and a profile 5 one as SDR;
+/// those stay unknown here. The Dolby Vision types only come from sources that
+/// do detect it, so they are taken at their word.
+fn probed_video_range(
+    pd: &crate::api::MediaSourceInfo,
+    range: &StreamVideoRange,
+) -> Evidence {
+    use crate::api::VideoRangeType as V;
+    use Evidence::{Absent as A, Present as P, Unknown as U};
+    use StreamVideoRange as R;
+    let Some(probed) = pd
+        .media_streams
+        .iter()
+        .find(|s| s.type_ == Some(MediaStreamType::Video))
+        .and_then(|s| {
+            s.video_range_type
+                .as_ref()
+        })
+    else {
+        return U;
+    };
+    match (probed, range) {
+        (V::Other, _) => U,
+        (V::Sdr, R::Sdr) => P,
+        (_, R::Sdr) => A,
+        (V::Sdr, R::DolbyVision) => U,
+        (V::Sdr, _) => A,
+        (V::Hdr10, R::Hdr | R::Hdr10) => P,
+        (V::Hdr10, R::Hlg) => A,
+        (V::Hdr10, R::Hdr10Plus | R::DolbyVision) => U,
+        (V::Hdr10Plus, R::Hdr | R::Hdr10 | R::Hdr10Plus) => P,
+        (V::Hdr10Plus, R::Hlg) => A,
+        (V::Hdr10Plus, R::DolbyVision) => U,
+        (V::Hlg, R::Hdr | R::Hlg) => P,
+        (V::Hlg, R::Hdr10 | R::Hdr10Plus) => A,
+        (V::Hlg, R::DolbyVision) => U,
+        (V::Dovi | V::DoviWithSdr, R::DolbyVision) => P,
+        (V::Dovi | V::DoviWithSdr, _) => A,
+        (V::DoviWithHdr10, R::Hdr | R::Hdr10 | R::DolbyVision) => P,
+        (V::DoviWithHdr10, R::Hlg) => A,
+        (V::DoviWithHdr10, R::Hdr10Plus) => U,
+        (V::DoviWithHlg, R::Hdr | R::Hlg | R::DolbyVision) => P,
+        (V::DoviWithHlg, R::Hdr10 | R::Hdr10Plus) => A,
+    }
+}
+
+fn probed_audio_format(
+    pd: &crate::api::MediaSourceInfo,
+    format: &StreamAudioFormat,
+) -> Evidence {
+    let answers: Vec<Option<bool>> = pd
+        .media_streams
+        .iter()
+        .filter(|s| s.type_ == Some(MediaStreamType::Audio))
+        .map(|track| track_has_format(track, format))
+        .collect();
+    if answers.contains(&Some(true)) {
+        Evidence::Present
+    } else if answers.is_empty() || answers.contains(&None) {
+        Evidence::Unknown
+    } else {
+        Evidence::Absent
+    }
+}
+
+/// `None` when the track's metadata can't settle it. ffprobe names Atmos,
+/// DTS:X and DTS-HD MA only in the profile ("Dolby TrueHD + Dolby Atmos",
+/// "DTS-HD MA + DTS:X"), and plain TrueHD / E-AC-3 tracks carry no profile at
+/// all, so a missing profile on those codecs proves nothing.
+fn track_has_format(
+    track: &crate::api::MediaStream,
+    format: &StreamAudioFormat,
+) -> Option<bool> {
+    use StreamAudioFormat as F;
+    let codec: AudioCodec = track
+        .codec
+        .as_deref()?
+        .parse()
+        .ok()?;
+    let profile_says = |needle: &str| {
+        track
+            .profile
+            .as_deref()
+            .map(|p| {
+                p.to_ascii_lowercase()
+                    .contains(needle)
+            })
+    };
+    match format {
+        F::Atmos if matches!(codec, AudioCodec::TrueHd | AudioCodec::Eac3) => {
+            profile_says("atmos")
+        }
+        F::DtsX if codec == AudioCodec::Dts => profile_says("dts:x"),
+        F::DtsHdMa if codec == AudioCodec::Dts => profile_says("dts-hd ma"),
+        F::Atmos | F::DtsX | F::DtsHdMa => Some(false),
+        F::TrueHd => Some(codec == AudioCodec::TrueHd),
+        F::Dts => Some(codec == AudioCodec::Dts),
+        F::DolbyDigitalPlus => Some(codec == AudioCodec::Eac3),
+        F::DolbyDigital => Some(codec == AudioCodec::Ac3),
+        F::Aac => Some(codec == AudioCodec::Aac),
+        F::Flac => Some(codec == AudioCodec::Flac),
+        F::Pcm => Some(codec == AudioCodec::Pcm),
+    }
+}
+
+/// Feature tags in a release's filename, addon name and description, e.g.
+/// "Movie.2160p.DV.HDR10.TrueHD.Atmos" or an addon label "4K | DV | HDR".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ReleaseTags {
+    video: Vec<StreamVideoRange>,
+    sdr: bool,
+    audio: Vec<StreamAudioFormat>,
+}
+
+impl ReleaseTags {
+    fn scan(info: &StreamInfo) -> Self {
+        use StreamAudioFormat as F;
+        use StreamVideoRange as R;
+        let text = [&info.filename, &info.name, &info.description]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // "DTS:X" and "E-AC-3" split into several tokens, so some tags are
+        // read together with their neighbours.
+        let tokens: Vec<&str> = text
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '+'))
+            .filter(|t| !t.is_empty())
+            .collect();
+        let at = |i: usize| {
+            tokens
+                .get(i)
+                .copied()
+                .unwrap_or_default()
+        };
+        let mut tags = Self::default();
+        for (i, &t) in tokens
+            .iter()
+            .enumerate()
+        {
+            let (prev, next, next2) = (
+                i.checked_sub(1)
+                    .map_or("", at),
+                at(i + 1),
+                at(i + 2),
+            );
+            if t == "SDR" {
+                tags.sdr = true;
+            }
+            let video: &[R] = match t {
+                "HDR" => &[R::Hdr],
+                "HDR10" => &[R::Hdr10, R::Hdr],
+                "HDR10+" | "HDR10PLUS" => &[R::Hdr10Plus, R::Hdr10, R::Hdr],
+                "HLG" => &[R::Hlg, R::Hdr],
+                "DV" | "DOVI" | "DOLBYVISION" => &[R::DolbyVision],
+                "DOLBY" if next == "VISION" => &[R::DolbyVision],
+                _ => &[],
+            };
+            for range in video {
+                if !tags
+                    .video
+                    .contains(range)
+                {
+                    tags.video
+                        .push(range.clone());
+                }
+            }
+            let audio: &[F] = match t {
+                "ATMOS" => &[F::Atmos],
+                "TRUEHD" => &[F::TrueHd],
+                "DTSX" => &[F::DtsX, F::Dts],
+                "DTS" if next == "X" => &[F::DtsX, F::Dts],
+                "DTSHDMA" => &[F::DtsHdMa, F::Dts],
+                "DTS" if next == "HDMA" || (next == "HD" && next2 == "MA") => {
+                    &[F::DtsHdMa, F::Dts]
+                }
+                "DTSHD" if next == "MA" => &[F::DtsHdMa, F::Dts],
+                t if t.starts_with("DTS") => &[F::Dts],
+                t if t.starts_with("DDPA") => &[F::Atmos, F::DolbyDigitalPlus],
+                t if t.starts_with("DDP") || t.starts_with("DD+") => {
+                    &[F::DolbyDigitalPlus]
+                }
+                "EAC3" => &[F::DolbyDigitalPlus],
+                "E" if next == "AC3" || (next == "AC" && next2 == "3") => {
+                    &[F::DolbyDigitalPlus]
+                }
+                "AC3" if prev != "E" => &[F::DolbyDigital],
+                "AC" if next == "3" && prev != "E" => &[F::DolbyDigital],
+                t if t.starts_with("DD")
+                    && t[2..]
+                        .chars()
+                        .all(|c| c.is_ascii_digit()) =>
+                {
+                    &[F::DolbyDigital]
+                }
+                t if t.starts_with("AAC") => &[F::Aac],
+                t if t.starts_with("FLAC") => &[F::Flac],
+                "PCM" | "LPCM" => &[F::Pcm],
+                _ => &[],
+            };
+            for format in audio {
+                if !tags
+                    .audio
+                    .contains(format)
+                {
+                    tags.audio
+                        .push(format.clone());
+                }
+            }
+        }
+        tags
+    }
+}
+
 fn auto_name(filter: &StreamFilter) -> String {
     let parts: Vec<String> = filter
         .rules
@@ -718,6 +1072,16 @@ fn auto_name(filter: &StreamFilter) -> String {
                         vec![format!("{} addons", values.len())]
                     }
                 }
+                StreamRule::VideoRange { values, .. } => values
+                    .iter()
+                    .map(|v| v.label())
+                    .map(str::to_owned)
+                    .collect(),
+                StreamRule::AudioFormat { values, .. } => values
+                    .iter()
+                    .map(|v| v.label())
+                    .map(str::to_owned)
+                    .collect(),
             };
             if labels.is_empty() {
                 None
@@ -1257,5 +1621,426 @@ mod tests {
         let unknown = stream_media(None);
         let known = stream_media(Some("Movie.2024.1080p.WEBRip.mkv"));
         assert!(known.quality_weight() > unknown.quality_weight());
+    }
+
+    fn feature_group(rule: StreamRule) -> StreamGroup {
+        StreamGroup {
+            id: Uuid::nil(),
+            name: "feature".to_string(),
+            filter: StreamFilter {
+                match_mode: FilterMatchMode::All,
+                rules: vec![rule],
+            },
+            priority: 0,
+            enabled: true,
+            hidden: false,
+            created_at: String::new(),
+        }
+    }
+
+    fn video_range_group(op: SetOp, values: &[StreamVideoRange]) -> StreamGroup {
+        feature_group(StreamRule::VideoRange {
+            op,
+            values: values.to_vec(),
+        })
+    }
+
+    fn format_group(op: SetOp, formats: &[StreamAudioFormat]) -> StreamGroup {
+        feature_group(StreamRule::AudioFormat {
+            op,
+            values: formats.to_vec(),
+        })
+    }
+
+    fn atmos_group(op: SetOp) -> StreamGroup {
+        format_group(op, &[StreamAudioFormat::Atmos])
+    }
+
+    fn probe_video(range: crate::api::VideoRangeType) -> crate::api::MediaSourceInfo {
+        crate::api::MediaSourceInfo {
+            media_streams: vec![crate::api::MediaStream {
+                type_: Some(MediaStreamType::Video),
+                codec: Some("hevc".to_string()),
+                video_range_type: Some(range),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn probe_audio(codec: &str, profile: Option<&str>) -> crate::api::MediaSourceInfo {
+        probe_tracks(&[(codec, profile)])
+    }
+
+    fn probe_tracks(tracks: &[(&str, Option<&str>)]) -> crate::api::MediaSourceInfo {
+        crate::api::MediaSourceInfo {
+            media_streams: tracks
+                .iter()
+                .map(|(codec, profile)| crate::api::MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    codec: Some(codec.to_string()),
+                    profile: profile.map(str::to_string),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    const PLAIN_HEVC_4K: &str = "Movie.2023.2160p.WEB-DL.DDP5.1.H.265-GROUP.mkv";
+
+    /// Every range a filename is tagged with matches, and SDR is ruled out;
+    /// the others are unproven and pass through.
+    #[test]
+    fn video_range_tags_in_filename() {
+        use StreamVideoRange as R;
+        let cases: &[(&str, &[R])] = &[
+            (
+                "Movie.2023.2160p.WEB-DL.DV.HDR10.DDP5.1.H.265-GROUP.mkv",
+                &[R::DolbyVision, R::Hdr10, R::Hdr],
+            ),
+            (
+                "Movie.2023.2160p.BluRay.REMUX.DoVi.HEVC-GROUP.mkv",
+                &[R::DolbyVision],
+            ),
+            (
+                "Movie.2023.2160p.WEB-DL.Dolby.Vision.H.265-GROUP.mkv",
+                &[R::DolbyVision],
+            ),
+            (
+                "Movie.2023.2160p.UHD.BluRay.x265.HDR10+.TrueHD-GROUP.mkv",
+                &[R::Hdr10Plus, R::Hdr10, R::Hdr],
+            ),
+            (
+                "Movie.2023.2160p.WEB-DL.HDR10Plus.H.265-GROUP.mkv",
+                &[R::Hdr10Plus, R::Hdr10, R::Hdr],
+            ),
+            ("Movie.2023.2160p.WEB-DL.HDR.H.265-GROUP.mkv", &[R::Hdr]),
+            (
+                "Movie.2023.2160p.HDTV.HLG.H.265-GROUP.mkv",
+                &[R::Hlg, R::Hdr],
+            ),
+        ];
+        for (filename, tagged) in cases {
+            for range in R::all() {
+                let expected = if tagged.contains(range) {
+                    MatchOutcome::Match
+                } else if *range == R::Sdr {
+                    MatchOutcome::NoMatch
+                } else {
+                    MatchOutcome::PassThrough
+                };
+                assert_eq!(
+                    video_range_group(SetOp::In, &[range.clone()])
+                        .match_outcome(&info(filename), None),
+                    expected,
+                    "{filename} / {range:?}"
+                );
+            }
+        }
+    }
+
+    // HEVC is not evidence of HDR or Dolby Vision, so an untagged unprobed
+    // HEVC release must neither join an HDR group nor be ruled out of it.
+    #[test]
+    fn hevc_alone_is_not_hdr_or_dolby_vision() {
+        for range in StreamVideoRange::all() {
+            assert_eq!(
+                video_range_group(SetOp::In, &[range.clone()])
+                    .match_outcome(&info(PLAIN_HEVC_4K), None),
+                MatchOutcome::PassThrough,
+                "{range:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdr_tag_matches_sdr_and_rules_out_every_other_range() {
+        let sdr = info("Movie.2023.2160p.WEB-DL.SDR.H.265-GROUP.mkv");
+        for range in StreamVideoRange::all() {
+            let expected = if *range == StreamVideoRange::Sdr {
+                MatchOutcome::Match
+            } else {
+                MatchOutcome::NoMatch
+            };
+            let group = video_range_group(SetOp::In, &[range.clone()]);
+            assert_eq!(group.match_outcome(&sdr, None), expected, "{range:?}");
+        }
+    }
+
+    /// The probe settles only what the colour transfer shows. It can't see
+    /// Dolby Vision or HDR10+, so those stay unknown unless the source itself
+    /// reported a Dolby Vision type.
+    #[test]
+    fn probed_video_range_settles_only_what_the_probe_can_see() {
+        use crate::api::VideoRangeType as V;
+        use MatchOutcome::{Match as M, NoMatch as N, PassThrough as U};
+        let file = info(PLAIN_HEVC_4K);
+        // Columns: SDR, HDR (any), HDR10, HDR10+, HLG, Dolby Vision.
+        let table = [
+            (V::Sdr, [M, N, N, N, N, U]),
+            (V::Hdr10, [N, M, M, U, N, U]),
+            (V::Hdr10Plus, [N, M, M, M, N, U]),
+            (V::Hlg, [N, M, N, N, M, U]),
+            (V::Dovi, [N, N, N, N, N, M]),
+            (V::DoviWithHdr10, [N, M, M, U, N, M]),
+            (V::DoviWithHlg, [N, M, N, N, M, M]),
+            (V::Other, [U, U, U, U, U, U]),
+        ];
+        for (probed, expected) in table {
+            let probe = probe_video(probed.clone());
+            for (range, want) in StreamVideoRange::all()
+                .iter()
+                .zip(expected)
+            {
+                assert_eq!(
+                    video_range_group(SetOp::In, &[range.clone()])
+                        .match_outcome(&file, Some(&probe)),
+                    want,
+                    "{probed:?} / {range:?}"
+                );
+            }
+        }
+    }
+
+    // ffprobe reports a profile 8 Dolby Vision file as plain HDR10, so the
+    // probe must not overrule the release's DV tag.
+    #[test]
+    fn dolby_vision_tag_survives_an_hdr10_probe() {
+        let file = info("Movie.2023.2160p.WEB-DL.DV.HDR10.H.265-GROUP.mkv");
+        let probe = probe_video(crate::api::VideoRangeType::Hdr10);
+        assert_eq!(
+            video_range_group(SetOp::In, &[StreamVideoRange::DolbyVision])
+                .match_outcome(&file, Some(&probe)),
+            MatchOutcome::Match
+        );
+    }
+
+    // ffprobe reports a profile 5 Dolby Vision file as SDR, so a DV tag must
+    // keep it out of SDR groups.
+    #[test]
+    fn dolby_vision_tag_overrules_an_sdr_probe() {
+        let file = info("Movie.2023.2160p.WEB-DL.DV.H.265-GROUP.mkv");
+        let probe = probe_video(crate::api::VideoRangeType::Sdr);
+        assert_eq!(
+            video_range_group(SetOp::In, &[StreamVideoRange::Sdr])
+                .match_outcome(&file, Some(&probe)),
+            MatchOutcome::NoMatch
+        );
+        assert_eq!(
+            video_range_group(SetOp::In, &[StreamVideoRange::DolbyVision])
+                .match_outcome(&file, Some(&probe)),
+            MatchOutcome::Match
+        );
+    }
+
+    #[test]
+    fn video_range_not_in_excludes_tagged_and_keeps_proven_absence() {
+        let not_dv = video_range_group(SetOp::NotIn, &[StreamVideoRange::DolbyVision]);
+        let dv = info("Movie.2023.2160p.WEB-DL.DV.H.265-GROUP.mkv");
+        assert_eq!(not_dv.match_outcome(&dv, None), MatchOutcome::NoMatch);
+        assert_eq!(
+            not_dv.match_outcome(&info(PLAIN_HEVC_4K), None),
+            MatchOutcome::PassThrough
+        );
+        let not_hlg = video_range_group(SetOp::NotIn, &[StreamVideoRange::Hlg]);
+        assert_eq!(
+            not_hlg.match_outcome(
+                &info(PLAIN_HEVC_4K),
+                Some(&probe_video(crate::api::VideoRangeType::Hdr10))
+            ),
+            MatchOutcome::Match
+        );
+    }
+
+    #[test]
+    fn addon_label_tags_count_as_evidence() {
+        let group = video_range_group(SetOp::In, &[StreamVideoRange::DolbyVision]);
+        let stream = StreamInfo {
+            filename: Some(PLAIN_HEVC_4K.to_string()),
+            name: Some("AIO 4K | DV | HDR".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(group.match_outcome(&stream, None), MatchOutcome::Match);
+    }
+
+    #[test]
+    fn atmos_tags_in_filename_match() {
+        let group = atmos_group(SetOp::In);
+        for filename in [
+            "Movie.2023.2160p.WEB-DL.DDP5.1.Atmos.H.265-GROUP.mkv",
+            "Movie.2023.2160p.BluRay.REMUX.TrueHD.7.1.Atmos-GROUP.mkv",
+            "Movie.2023.2160p.WEB-DL.DDPA5.1.H.265-GROUP.mkv",
+        ] {
+            assert_eq!(
+                group.match_outcome(&info(filename), None),
+                MatchOutcome::Match,
+                "{filename}"
+            );
+        }
+        assert_eq!(
+            group.match_outcome(&info(PLAIN_HEVC_4K), None),
+            MatchOutcome::PassThrough
+        );
+    }
+
+    #[test]
+    fn probed_atmos_reads_the_audio_profile() {
+        let group = atmos_group(SetOp::In);
+        let file = info(PLAIN_HEVC_4K);
+        for (probe, expected) in [
+            (
+                probe_audio("truehd", Some("Dolby TrueHD + Dolby Atmos")),
+                MatchOutcome::Match,
+            ),
+            (
+                probe_audio("eac3", Some("Dolby Digital Plus + Dolby Atmos")),
+                MatchOutcome::Match,
+            ),
+            (
+                probe_audio("eac3", Some("Dolby Digital Plus")),
+                MatchOutcome::NoMatch,
+            ),
+            (probe_audio("aac", None), MatchOutcome::NoMatch),
+            // An older ffprobe reports no profile, which proves nothing.
+            (probe_audio("truehd", None), MatchOutcome::PassThrough),
+        ] {
+            assert_eq!(
+                group.match_outcome(&file, Some(&probe)),
+                expected,
+                "{probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn atmos_not_in_drops_atmos_releases() {
+        let group = atmos_group(SetOp::NotIn);
+        let atmos = info("Movie.2023.2160p.WEB-DL.DDP5.1.Atmos.H.265-GROUP.mkv");
+        assert_eq!(group.match_outcome(&atmos, None), MatchOutcome::NoMatch);
+        assert_eq!(
+            group.match_outcome(&info(PLAIN_HEVC_4K), Some(&probe_audio("ac3", None))),
+            MatchOutcome::Match
+        );
+    }
+
+    /// Every format a filename is tagged with matches; every other format is
+    /// unproven, so it passes through instead of failing.
+    #[test]
+    fn audio_format_tags_in_filename() {
+        use StreamAudioFormat as F;
+        let cases: &[(&str, &[F])] = &[
+            (
+                "Movie.2023.2160p.BluRay.REMUX.TrueHD.7.1.Atmos-GROUP.mkv",
+                &[F::TrueHd, F::Atmos],
+            ),
+            (
+                "Movie.2023.2160p.BluRay.REMUX.DTS-HD.MA.7.1-GROUP.mkv",
+                &[F::DtsHdMa, F::Dts],
+            ),
+            (
+                "Movie.2023.2160p.BluRay.REMUX.DTS-X.7.1-GROUP.mkv",
+                &[F::DtsX, F::Dts],
+            ),
+            ("Movie.2023.1080p.BluRay.DTS.5.1.x264-GROUP.mkv", &[F::Dts]),
+            (
+                "Movie.2023.2160p.WEB-DL.DDP5.1.Atmos.H.265-GROUP.mkv",
+                &[F::DolbyDigitalPlus, F::Atmos],
+            ),
+            (
+                "Movie.2023.2160p.WEB-DL.DDPA5.1.H.265-GROUP.mkv",
+                &[F::DolbyDigitalPlus, F::Atmos],
+            ),
+            (
+                "Movie.2023.1080p.WEB-DL.E-AC-3.H.264-GROUP.mkv",
+                &[F::DolbyDigitalPlus],
+            ),
+            (
+                "Movie.2023.1080p.BluRay.DD5.1.x264-GROUP.mkv",
+                &[F::DolbyDigital],
+            ),
+            (
+                "Movie.2023.1080p.BluRay.AC3.x264-GROUP.mkv",
+                &[F::DolbyDigital],
+            ),
+            ("Movie.2023.1080p.WEBRip.AAC2.0.x264-GROUP.mkv", &[F::Aac]),
+            (
+                "Movie.2023.1080p.BluRay.FLAC.2.0.x264-GROUP.mkv",
+                &[F::Flac],
+            ),
+            ("Movie.2023.1080p.BluRay.LPCM.2.0.AVC-GROUP.mkv", &[F::Pcm]),
+        ];
+        for (filename, tagged) in cases {
+            for format in F::all() {
+                let expected = if tagged.contains(format) {
+                    MatchOutcome::Match
+                } else {
+                    MatchOutcome::PassThrough
+                };
+                assert_eq!(
+                    format_group(SetOp::In, &[format.clone()])
+                        .match_outcome(&info(filename), None),
+                    expected,
+                    "{filename} / {format:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probed_dts_profile_settles_dts_variants() {
+        use StreamAudioFormat as F;
+        let file = info(PLAIN_HEVC_4K);
+        let dts_x = probe_audio("dts", Some("DTS-HD MA + DTS:X"));
+        for (format, expected) in [
+            (F::DtsX, MatchOutcome::Match),
+            (F::DtsHdMa, MatchOutcome::Match),
+            (F::Dts, MatchOutcome::Match),
+            (F::TrueHd, MatchOutcome::NoMatch),
+            (F::Atmos, MatchOutcome::NoMatch),
+        ] {
+            assert_eq!(
+                format_group(SetOp::In, &[format.clone()])
+                    .match_outcome(&file, Some(&dts_x)),
+                expected,
+                "{format:?}"
+            );
+        }
+        let core = probe_audio("dts", Some("DTS"));
+        assert_eq!(
+            format_group(SetOp::In, &[F::DtsHdMa]).match_outcome(&file, Some(&core)),
+            MatchOutcome::NoMatch
+        );
+    }
+
+    // A probe beats the filename: a release tagged DTS whose only audio
+    // track is AAC was re-encoded, so it is not DTS.
+    #[test]
+    fn probed_codec_overrides_filename_tag() {
+        let file = info("Movie.2023.1080p.BluRay.DTS.5.1.x264-GROUP.mkv");
+        assert_eq!(
+            format_group(SetOp::In, &[StreamAudioFormat::Dts])
+                .match_outcome(&file, Some(&probe_audio("aac", None))),
+            MatchOutcome::NoMatch
+        );
+    }
+
+    #[test]
+    fn any_track_can_prove_a_format() {
+        let file = info(PLAIN_HEVC_4K);
+        let atmos = atmos_group(SetOp::In);
+        let mixed = probe_tracks(&[
+            ("truehd", None),
+            ("eac3", Some("Dolby Digital Plus + Dolby Atmos")),
+        ]);
+        assert_eq!(
+            atmos.match_outcome(&file, Some(&mixed)),
+            MatchOutcome::Match
+        );
+        let unsettled = probe_tracks(&[("aac", None), ("truehd", None)]);
+        assert_eq!(
+            atmos.match_outcome(&file, Some(&unsettled)),
+            MatchOutcome::PassThrough
+        );
     }
 }
