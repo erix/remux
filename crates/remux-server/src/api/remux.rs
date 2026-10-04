@@ -535,6 +535,16 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
                             format!("{} addons", values.len())
                         }
                     }
+                    StreamRule::VideoRange { values, .. } => values
+                        .iter()
+                        .map(|v| v.label())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    StreamRule::AudioFormat { values, .. } => values
+                        .iter()
+                        .map(|v| v.label())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                 })
                 .filter(|s| !s.is_empty())
                 .collect();
